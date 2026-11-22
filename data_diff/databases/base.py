@@ -1187,6 +1187,16 @@ class Database(abc.ABC):
         callback = partial(self._query_cursor, c)
         return apply_query(callback, sql_code)
 
+    # -- Snapshot consistency hooks -------------------------------------------
+    # Databases that can expose a stable per-connection read view override
+    # these.  The default is "not supported", which lets callers reject
+    # consistency="snapshot" before any business table is queried.
+    def supports_snapshot_consistency(self) -> bool:
+        return False
+
+    def open_snapshot_view(self, worker_count: int, tables: Sequence = ()):
+        raise NotImplementedError(f"Snapshot consistency is not supported by {self.name}")
+
     def close(self):
         """Close connection(s) to the database instance. Querying will stop functioning."""
         self.is_closed = True

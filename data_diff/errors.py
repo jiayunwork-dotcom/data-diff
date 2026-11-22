@@ -72,3 +72,15 @@ class DataDiffSimpleSelectNotFound(Exception):
 
 class DataDiffMismatchingKeyTypesError(Exception):
     "Raised when the key types of two tables do not match, like VARCHAR and INT."
+
+
+class DataDiffConsistencyError(ValueError):
+    "Raised when the requested consistency mode cannot be honoured for the given databases/algorithm."
+
+
+class DataDiffUnsupportedConsistencyError(DataDiffConsistencyError, NotImplementedError):
+    "Raised when consistency='snapshot' is requested for a database or algorithm that does not support it."
+
+
+class DataDiffIncompleteResultError(RuntimeError):
+    "Raised when consuming or summarising a diff result that was closed before it was fully consumed."

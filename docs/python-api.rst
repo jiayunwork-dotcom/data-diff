@@ -12,6 +12,12 @@ Python API Reference
 .. autoclass:: HashDiffer
     :members: __init__, diff_tables
 
+.. autoclass:: data_diff.diff_tables.Consistency
+    :members:
+
+.. autoclass:: data_diff.diff_tables.DiffResultWrapper
+    :members: __iter__, close, __enter__, __exit__, get_stats_string, get_stats_dict
+
 .. autoclass:: JoinDiffer
     :members: __init__, diff_tables
 

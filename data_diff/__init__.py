@@ -4,7 +4,8 @@ from data_diff.abcs.database_types import DbTime, DbPath
 from data_diff.databases import Database
 from data_diff.tracking import disable_tracking
 from data_diff.databases._connect import connect
-from data_diff.diff_tables import Algorithm
+from data_diff.errors import DataDiffConsistencyError, DataDiffUnsupportedConsistencyError
+from data_diff.diff_tables import Algorithm, Consistency
 from data_diff.hashdiff_tables import HashDiffer, DEFAULT_BISECTION_THRESHOLD, DEFAULT_BISECTION_FACTOR
 from data_diff.joindiff_tables import JoinDiffer, TABLE_WRITE_LIMIT
 from data_diff.table_segment import TableSegment
@@ -65,6 +66,8 @@ def diff_tables(
     algorithm: Algorithm = Algorithm.AUTO,
     # An additional 'where' expression to restrict the search space.
     where: str = None,
+    # "live" (default) or "snapshot" (one committed state per side; hash-diff only)
+    consistency: Union[str, Consistency] = Consistency.LIVE,
     # Into how many segments to bisect per iteration (hashdiff only)
     bisection_factor: int = DEFAULT_BISECTION_FACTOR,
     # When should we stop bisecting and compare locally (in row count; hashdiff only)
@@ -98,6 +101,9 @@ def diff_tables(
                                    Only relevant when `threaded` is ``True``.
                                    There may be many pools, so number of actual threads can be a lot higher.
         where (str, optional): An additional 'where' expression to restrict the search space.
+        consistency (str): `"live"` (default) reads whatever is committed per query;
+                           `"snapshot"` fixes one committed state per side before any data is read.
+                           Only supported with `HASHDIFF` on PostgreSQL 16, plain tables.
         algorithm (:class:`Algorithm`): Which diffing algorithm to use (`HASHDIFF` or `JOINDIFF`. Default=`AUTO`)
         bisection_factor (int): Into how many segments to bisect per iteration. (Used when algorithm is `HASHDIFF`)
         bisection_threshold (Number): Minimal row count of segment to bisect, otherwise download
@@ -149,9 +155,24 @@ def diff_tables(
 
     segments = [t.new(**override_attrs) for t in tables] if override_attrs else tables
 
+    try:
+        consistency = Consistency(consistency)
+    except ValueError:
+        raise DataDiffConsistencyError(
+            f"Unknown consistency {consistency!r}; expected one of {[c.value for c in Consistency]}."
+        ) from None
+
     algorithm = Algorithm(algorithm)
     if algorithm == Algorithm.AUTO:
         algorithm = Algorithm.JOINDIFF if table1.database is table2.database else Algorithm.HASHDIFF
+
+    if consistency is Consistency.SNAPSHOT and algorithm is not Algorithm.HASHDIFF:
+        # Reject before any business table is queried.  AUTO only reaches here
+        # when it actually resolved to JOINDIFF.
+        raise DataDiffUnsupportedConsistencyError(
+            "consistency='snapshot' is only supported with the hash-diff algorithm; "
+            f"got algorithm={algorithm.value!r}."
+        )
 
     if algorithm == Algorithm.HASHDIFF:
         differ = HashDiffer(
@@ -177,4 +198,4 @@ def diff_tables(
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
-    return differ.diff_tables(*segments)
+    return differ.diff_tables(*segments, consistency=consistency)

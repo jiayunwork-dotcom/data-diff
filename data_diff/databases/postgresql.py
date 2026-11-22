@@ -204,6 +204,30 @@ class PostgreSQL(ThreadedDatabase):
         except pg.OperationalError as e:
             raise ConnectError(*e.args) from e
 
+    # -- Snapshot consistency -------------------------------------------------
+    # A read view needs its own short-lived connections; they are deliberately
+    # separate from the caller's `thread_count` pool so that the caller can
+    # keep using its original connection objects normally.
+    def supports_snapshot_consistency(self) -> bool:
+        return True
+
+    def _new_snapshot_connection(self, role: str = "worker"):
+        if self.is_closed:
+            raise ConnectError(f"{self.name}: cannot open a snapshot view on a closed database")
+        pg = import_postgresql()
+        args = dict(self._args)
+        args["password"] = unquote(args["password"])
+        args.setdefault("application_name", f"data_diff_snapshot:{role}")
+        try:
+            return pg.connect(**args)
+        except pg.OperationalError as e:
+            raise ConnectError(*e.args) from e
+
+    def open_snapshot_view(self, worker_count: int, tables=()):
+        from data_diff.consistency import PostgresSnapshotView
+
+        return PostgresSnapshotView(self, worker_count, tables)
+
     def select_table_schema(self, path: DbPath) -> str:
         database, schema, table = self._normalize_table_path(path)
 

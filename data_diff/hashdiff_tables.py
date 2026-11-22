@@ -100,11 +100,17 @@ class HashDiffer(TableDiffer):
         max_threadpool_size (int): Maximum size of each threadpool. ``None`` means auto.
                                    Only relevant when `threaded` is ``True``.
                                    There may be many pools, so number of actual threads can be a lot higher.
+        consistency (str): "live" (default) or "snapshot". Snapshot mode reads each side from one
+                           committed state, fixed when the result is first consumed. It is available
+                           through :meth:`diff_tables` for PostgreSQL 16 plain tables only.
     """
 
     bisection_factor: int = DEFAULT_BISECTION_FACTOR
     bisection_threshold: int = DEFAULT_BISECTION_THRESHOLD
     bisection_disabled: bool = False  # i.e. always download the rows (used in tests)
+
+    # The hash-diff path is the one that supports per-side snapshot reads.
+    SNAPSHOT_CONSISTENCY_SUPPORTED = True
 
     stats: dict = attrs.field(factory=dict)
 

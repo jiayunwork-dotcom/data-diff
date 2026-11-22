@@ -68,6 +68,10 @@ class Redshift(PostgreSQL):
     CONNECT_URI_HELP = "redshift://<user>:<password>@<host>/<database>"
     CONNECT_URI_PARAMS = ["database?"]
 
+    def supports_snapshot_consistency(self) -> bool:
+        # Exported snapshots are a PostgreSQL feature; Redshift does not offer them.
+        return False
+
     def select_table_schema(self, path: DbPath) -> str:
         database, schema, table = self._normalize_table_path(path)
 
