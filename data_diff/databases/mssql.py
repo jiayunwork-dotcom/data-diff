@@ -160,6 +160,10 @@ class Dialect(BaseDialect):
     def md5_as_hex(self, s: str) -> str:
         return f"HashBytes('MD5', {s})"
 
+    def md5_as_lower_hex(self, s: str) -> str:
+        # HashBytes returns varbinary; style 2 renders it as (uppercase) hex text.
+        return f"LOWER(CONVERT(NVARCHAR(32), HashBytes('MD5', {s}), 2))"
+
 
 @attrs.define(frozen=False, init=False, kw_only=True)
 class MsSQL(ThreadedDatabase):

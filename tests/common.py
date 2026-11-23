@@ -127,6 +127,25 @@ def str_to_checksum(str: str):
     return int(md5[half_pos:], 16) - db.CHECKSUM_OFFSET
 
 
+def row_values_to_checksum(values) -> int:
+    """Reference implementation of the documented checksum row encoding.
+
+    Each column is encoded as a self-delimiting token: 'N' for SQL NULL, or
+    'V' followed by the md5 hex of the normalized value.  The concatenated
+    tokens are then hashed and truncated like the databases do.  This mirrors
+    the specification in docs/comparison-semantics.md, independently of the
+    SQL implementation under test.
+    """
+    tokens = []
+    for v in values:
+        if v is None:
+            tokens.append(db.CHECKSUM_NULL_TOKEN)
+        else:
+            md5 = hashlib.md5(str(v).encode("utf-8")).hexdigest()
+            tokens.append(db.CHECKSUM_VALUE_TOKEN + md5)
+    return str_to_checksum("".join(tokens))
+
+
 class DiffTestCase(unittest.TestCase):
     """Sets up two tables for diffing"""
 

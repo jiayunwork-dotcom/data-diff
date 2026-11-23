@@ -133,6 +133,10 @@ class Dialect(
     def md5_as_hex(self, s: str) -> str:
         return f"standard_hash({s}, 'MD5')"
 
+    def md5_as_lower_hex(self, s: str) -> str:
+        # standard_hash returns RAW; RAWTOHEX renders it as uppercase hex text.
+        return f"LOWER(RAWTOHEX(standard_hash({s}, 'MD5')))"
+
     def normalize_uuid(self, value: str, coltype: ColType_UUID) -> str:
         # Cast is necessary for correct MD5 (trimming not enough)
         return f"CAST(TRIM({value}) AS VARCHAR(36))"

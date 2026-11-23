@@ -3,6 +3,7 @@ import logging
 import math
 import re
 import string
+import decimal
 from abc import abstractmethod
 from typing import Any, Dict, Iterable, Iterator, List, MutableMapping, Optional, Sequence, TypeVar, Union
 from urllib.parse import urlparse
@@ -514,23 +515,85 @@ def diff_int_dynamic_color_template(diff_value: int) -> str:
         return "0"
 
 
-def _jsons_equiv(a: str, b: str):
+def _reject_json_constant(value: str):
+    # Legal JSON has no NaN/Infinity; treat them as unparseable so that such
+    # documents compare as plain (unequal) texts instead of silently matching.
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def _parse_json_typed(s: str):
+    """Parse a JSON document, keeping numbers as exact decimals.
+
+    Using ``decimal.Decimal`` for both integers and floats makes numeric
+    comparison follow the exact decimal value: 1, 1.0 and 1e0 parse to equal
+    decimals, while big integers that doubles cannot represent exactly stay
+    distinct from their neighbours.
+    """
+    return json.loads(
+        s,
+        parse_float=decimal.Decimal,
+        parse_int=decimal.Decimal,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def json_values_equal(a, b) -> bool:
+    """Typed equality of two parsed JSON values.
+
+    - Object member order is insignificant; array order and multiplicity are not.
+    - Booleans are never equal to numbers (``true`` != ``1``), unlike Python's ``==``.
+    - ``null`` is only equal to ``null``; it differs from every string, including ``"null"``.
+    - Numbers compare by exact decimal value (``1`` == ``1.0`` == ``1e0``).
+    """
+    # bool must be checked before numbers: in Python, bool is a subclass of int.
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, decimal.Decimal) and isinstance(b, decimal.Decimal):
+        return a == b
+    if a is None or b is None:
+        return a is b
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(json_values_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(json_values_equal(a[k], b[k]) for k in a)
+    # Different JSON types (e.g. array vs object, string vs number) are never equal.
+    return False
+
+
+def jsons_equal_by_content(a: str, b: str) -> bool:
+    "True if two strings are both valid JSON and equal by JSON content."
     try:
-        return json.loads(a) == json.loads(b)
-    except (ValueError, TypeError, json.decoder.JSONDecodeError):  # not valid jsons
+        ja = _parse_json_typed(a)
+        jb = _parse_json_typed(b)
+    except (ValueError, TypeError):
         return False
+    return json_values_equal(ja, jb)
 
 
 def diffs_are_equiv_jsons(diff: list, json_cols: dict):
+    """Check whether a '-'/+' row pair is actually equal, column by column.
+
+    ``json_cols`` maps the index of each JSON-typed column (in the compared row
+    layout) to its name.  JSON columns compare by JSON content; every other
+    column compares as plain text, even if its value happens to parse as JSON.
+
+    Returns (match, overridden_cols): match tells whether the rows are
+    equivalent, and overridden_cols lists the JSON columns whose textual
+    representation differed while the content was equal.
+    """
     overriden_diff_cols = set()
     if (len(diff) != 2) or ({diff[0][0], diff[1][0]} != {"+", "-"}):
         return False, overriden_diff_cols
+    row_a, row_b = diff[0][1], diff[1][1]
+    if len(row_a) != len(row_b):
+        return False, overriden_diff_cols
     match = True
-    for i, (col_a, col_b) in enumerate(safezip(diff[0][1][1:], diff[1][1][1:])):  # index 0 is extra_columns first elem
-        # we only attempt to parse columns of JSON type, but we still need to check if non-json columns don't match
+    for i, (col_a, col_b) in enumerate(safezip(row_a, row_b)):
         match = col_a == col_b
         if not match and (i in json_cols):
-            if _jsons_equiv(col_a, col_b):
+            if col_a is not None and col_b is not None and jsons_equal_by_content(col_a, col_b):
                 overriden_diff_cols.add(json_cols[i])
                 match = True
         if not match:

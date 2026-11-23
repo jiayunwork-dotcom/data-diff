@@ -49,8 +49,10 @@ def diff_sets(
         pk: _PK = tuple(val for col, val in zip(key_columns2, row))
         rows_by_pks2[pk].append(row)
 
+    json_cols = json_cols or {}
+    warned_diff_cols = set()
+
     # Mind that the same pk MUST go in full with all the -/+ rows all at once, for grouping.
-    diffs_by_pks: Dict[_PK, List[Tuple[_Op, _Row]]] = defaultdict(list)
     for pk in sorted(set(rows_by_pks1) | set(rows_by_pks2)):
         cutrows1: List[_Row] = [
             tuple(val for col, val in zip(columns1, row1) if col not in ignored_columns1) for row1 in rows_by_pks1[pk]
@@ -62,17 +64,14 @@ def diff_sets(
         # Either side has 0 rows: a clearly exclusive row.
         # Either side has 2+ rows: duplicates on either side, yield it all regardless of values.
         # Both sides == 1: non-duplicate, non-exclusive, so check for values of interest.
-        if len(cutrows1) != 1 or len(cutrows2) != 1 or cutrows1 != cutrows2:
-            for row1 in rows_by_pks1[pk]:
-                diffs_by_pks[pk].append(("-", row1))
-            for row2 in rows_by_pks2[pk]:
-                diffs_by_pks[pk].append(("+", row2))
-
-    warned_diff_cols = set()
-    for diffs in (diffs_by_pks[pk] for pk in sorted(diffs_by_pks)):
-        if json_cols:
-            parsed_match, overriden_diff_cols = diffs_are_equiv_jsons(diffs, json_cols)
+        is_diff = True
+        if len(cutrows1) == 1 and len(cutrows2) == 1:
+            # json_cols is indexed by the position in the compared (cut) rows.
+            parsed_match, overriden_diff_cols = diffs_are_equiv_jsons(
+                [("-", cutrows1[0]), ("+", cutrows2[0])], json_cols
+            )
             if parsed_match:
+                is_diff = False
                 to_warn = overriden_diff_cols - warned_diff_cols
                 for w in to_warn:
                     logger.warning(
@@ -80,8 +79,12 @@ def diff_sets(
                         f"in column '{w}'. These cases are NOT reported as differences."
                     )
                     warned_diff_cols.add(w)
-                continue
-        yield from diffs
+
+        if is_diff:
+            for row1 in rows_by_pks1[pk]:
+                yield "-", row1
+            for row2 in rows_by_pks2[pk]:
+                yield "+", row2
 
 
 @attrs.define(frozen=False)
@@ -172,6 +175,22 @@ class HashDiffer(TableDiffer):
                         "If encoding/formatting differs between databases, it may result in false positives."
                     )
 
+    def _json_compared_columns(self, table1: TableSegment, table2: TableSegment) -> Dict[int, str]:
+        """Positions of the JSON-typed columns within the compared (non-ignored) rows.
+
+        The compared row layout is ``relevant_columns`` minus the ignored columns,
+        i.e. key columns first, then the update column, then the extra columns.
+        A position counts as JSON only when *both* sides type it as JSON; a plain
+        text column keeps plain text comparison even if its values parse as JSON.
+        """
+        compared1 = [c for c in table1.relevant_columns if c not in self.ignored_columns1]
+        compared2 = [c for c in table2.relevant_columns if c not in self.ignored_columns2]
+        return {
+            i: colname
+            for i, (colname, colname2) in enumerate(safezip(compared1, compared2))
+            if isinstance(table1._schema[colname], JSON) and isinstance(table2._schema[colname2], JSON)
+        }
+
     def _diff_segments(
         self,
         ti: ThreadedYielder,
@@ -241,11 +260,7 @@ class HashDiffer(TableDiffer):
         # This saves time, as bisection speed is limited by ping and query performance.
         if self.bisection_disabled or max_rows < self.bisection_threshold or max_space_size < self.bisection_factor * 2:
             rows1, rows2 = self._threaded_call("get_values", [table1, table2])
-            json_cols = {
-                i: colname
-                for i, colname in enumerate(table1.extra_columns)
-                if isinstance(table1._schema[colname], JSON)
-            }
+            json_cols = self._json_compared_columns(table1, table2)
             diff = list(
                 diff_sets(
                     rows1,

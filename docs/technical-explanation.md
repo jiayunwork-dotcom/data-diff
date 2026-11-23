@@ -96,6 +96,13 @@ FROM `rating_del1`
 WHERE (id >= 1) AND (id < 100000)
 ```
 
+> **Note:** The query above is simplified for illustration. The actual
+> checksum input encodes every column as a self-delimiting token (`N` for
+> SQL NULL, `V` + md5 of the value otherwise), so that column boundaries and
+> NULLs can never be confused by the content. See
+> [comparison-semantics.md](comparison-semantics.md) for the exact encoding,
+> the JSON comparison rules, and the design trade-offs.
+
 This keeps the amount of data that has to be transferred between the databases
 to a minimum, making it very performant! Additionally, if you have an index on
 `updated_at` (highly recommended), then the query will be fast, as the database

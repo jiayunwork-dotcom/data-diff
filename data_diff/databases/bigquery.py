@@ -163,6 +163,10 @@ class Dialect(BaseDialect):
     def md5_as_hex(self, s: str) -> str:
         return f"md5({s})"
 
+    def md5_as_lower_hex(self, s: str) -> str:
+        # BigQuery's md5() returns BYTES; TO_HEX renders lowercase hex.
+        return f"TO_HEX(md5({s}))"
+
     def normalize_timestamp(self, value: str, coltype: TemporalType) -> str:
         try:
             is_date = coltype.is_date

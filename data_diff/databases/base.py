@@ -409,16 +409,37 @@ class BaseDialect(abc.ABC):
         return self.compile(c, expr)
 
     def render_checksum(self, c: Compiler, elem: Checksum) -> str:
-        if len(elem.exprs) > 1:
-            exprs = [Code(f"coalesce({self.compile(c, expr)}, '<null>')") for expr in elem.exprs]
-            # exprs = [self.compile(c, e) for e in exprs]
-            expr = Concat(exprs, "|")
-        else:
-            # No need to coalesce - safe to assume that key cannot be null
-            (expr,) = elem.exprs
+        # Every column is encoded as a self-delimiting token:
+        #
+        #   'N'                       - the value is SQL NULL
+        #   'V' || md5_hex(<value>)   - any other value (always 33 chars)
+        #
+        # The concatenation of these tokens is uniquely decodable: a value
+        # token always starts with 'V' followed by exactly 32 hex digits,
+        # while the NULL token is the single character 'N'.  Column
+        # boundaries therefore never depend on the content of the values
+        # (which may freely contain '|', quotes, newlines, etc.), and no
+        # string, not even '<null>' or '', can impersonate a SQL NULL.
+        tokens = [Code(self._checksum_column_token(c, expr)) for expr in elem.exprs]
+        expr = Concat(tokens)
         expr = self.compile(c, expr)
         md5 = self.md5_as_int(expr)
         return f"sum({md5})"
+
+    def _checksum_column_token(self, c: Compiler, expr) -> str:
+        "SQL for the fixed-format checksum token of a single (already normalized) column."
+        compiled = self.compile(c, expr)
+        value_token = self.concat([f"'{CHECKSUM_VALUE_TOKEN}'", self.md5_as_lower_hex(compiled)])
+        return f"CASE WHEN {compiled} IS NULL THEN '{CHECKSUM_NULL_TOKEN}' ELSE {value_token} END"
+
+    def md5_as_lower_hex(self, s: str) -> str:
+        """SQL for the MD5 of `s` as a lowercase hex string.
+
+        Canonical across dialects, so that checksum tokens built from it
+        compare equal across databases.  ``md5_as_hex`` alone is not enough:
+        some dialects return uppercase hex, or even raw bytes instead of text.
+        """
+        return f"lower({self.md5_as_hex(s)})"
 
     def render_concat(self, c: Compiler, elem: Concat) -> str:
         if self._prevent_overflow_when_concat:
@@ -1280,6 +1301,11 @@ class ThreadedDatabase(Database):
 
 CHECKSUM_HEXDIGITS = 12  # Must be 12 or lower, otherwise SUM() overflows
 MD5_HEXDIGITS = 32
+
+# Token prefixes used to build the unambiguous per-row checksum input.
+# See BaseDialect.render_checksum for the encoding rules.
+CHECKSUM_NULL_TOKEN = "N"
+CHECKSUM_VALUE_TOKEN = "V"
 
 _CHECKSUM_BITSIZE = CHECKSUM_HEXDIGITS << 2
 CHECKSUM_MASK = (2**_CHECKSUM_BITSIZE) - 1

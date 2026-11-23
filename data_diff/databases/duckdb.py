@@ -18,6 +18,7 @@ from data_diff.abcs.database_types import (
     Text,
     FractionalType,
     Boolean,
+    JSON,
 )
 from data_diff.databases.base import (
     Database,
@@ -63,6 +64,8 @@ class Dialect(BaseDialect):
         # Text
         "VARCHAR": Text,
         "TEXT": Text,
+        # JSON
+        "JSON": JSON,
         # UUID
         "UUID": Native_UUID,
         # Bool

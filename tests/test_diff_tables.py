@@ -13,7 +13,7 @@ from data_diff.joindiff_tables import JoinDiffer
 from data_diff.table_segment import TableSegment, split_space, Vector
 from data_diff import databases as db
 
-from tests.common import str_to_checksum, test_each_database_in_list, DiffTestCase, table_segment
+from tests.common import row_values_to_checksum, test_each_database_in_list, DiffTestCase, table_segment
 
 
 TEST_DATABASES = {
@@ -157,8 +157,9 @@ class TestDiffTables(DiffTestCase):
         table = self.table.with_schema()
 
         self.assertEqual(1, table.count())
-        concatted = str(id_) + "|" + time
-        self.assertEqual(str_to_checksum(concatted), table.count_and_checksum()[1])
+        # The checksum input is the concatenation of per-column tokens:
+        # 'N' for NULL, or 'V' + md5(normalized value); NULLs never collide with strings.
+        self.assertEqual(row_values_to_checksum([id_, time]), table.count_and_checksum()[1])
 
     def test_diff_small_tables(self):
         time = "2022-01-01 00:00:00"

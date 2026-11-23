@@ -127,6 +127,9 @@ DATABASE_TYPES = {
         "boolean": [
             "BOOLEAN",
         ],
+        "json": [
+            "JSON",
+        ],
     },
     db.BigQuery: {
         "int": ["int"],
