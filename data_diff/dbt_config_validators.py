@@ -14,6 +14,7 @@ class ManifestJsonConfig(BaseModel):
             database: Optional[str]
             schema_: Optional[str] = Field(..., alias="schema")
             tags: List[str]
+            materialized: Optional[str] = None
 
         class Column(BaseModel):
             meta: Dict[str, Any]

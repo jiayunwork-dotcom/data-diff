@@ -252,6 +252,14 @@ click.Context.formatter_class = MyHelpFormatter
     help="Which directory to look in for the dbt_project.yml file. Default is the current working directory and its parents.",
 )
 @click.option(
+    "--dependency-policy",
+    default=None,
+    metavar="POLICY",
+    help="Only with --dbt: how selected-model dependencies constrain the comparison. "
+    "'require_identical' (default) keeps the existing behaviour; 'independent' only checks a model "
+    "once every selected ancestor is identical, and reports the rest as blocked.",
+)
+@click.option(
     "--select",
     "-s",
     default=None,
@@ -337,6 +345,7 @@ def main(conf, run, **kw) -> None:
                 columns_flag=kw["columns"],
                 production_database_flag=kw["prod_database"],
                 production_schema_flag=kw["prod_schema"],
+                dependency_policy=kw["dependency_policy"],
             )
         else:
             _data_diff(dbt_project_dir=project_dir_override, dbt_profiles_dir=profiles_dir_override, state=state, **kw)
@@ -520,6 +529,7 @@ def _data_diff(
     prod_schema,
     select,
     state,
+    dependency_policy=None,
     threads1=None,
     threads2=None,
     __conf__=None,

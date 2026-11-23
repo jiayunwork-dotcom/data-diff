@@ -28,6 +28,7 @@ from data_diff.databases.base import (
     parse_table_name,
 )
 from data_diff.schema import RawColumnInfo
+from data_diff.errors import DataDiffTableNotFoundError
 
 
 @import_helper(text="You can install it using 'pip install databricks-sql-connector'")
@@ -161,7 +162,7 @@ class Databricks(ThreadedDatabase):
             finally:
                 conn.close()
             if not rows:
-                raise RuntimeError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
+                raise DataDiffTableNotFoundError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
 
             d = {
                 r.COLUMN_NAME: RawColumnInfo(

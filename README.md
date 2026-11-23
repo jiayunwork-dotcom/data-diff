@@ -49,6 +49,24 @@ Learn more about how data-diff works with dbt:
 * dbt Cloud users should check out [Datafold's out-of-the-box deployment testing integration](https://www.datafold.com/data-deployment-testing)
 * Get support from the dbt Community Slack in [#tools-datafold](https://getdbt.slack.com/archives/C03D25A92UU)
 
+### Dependency-aware local checks
+
+By default (`--dependency-policy require_identical`) every selected model is compared independently,
+exactly as before. `--dependency-policy independent` makes the dbt dependency graph constrain the run:
+
+* a model is only compared once every *selected* ancestor has settled `identical`;
+* otherwise it is reported `blocked`, with the full list of non-identical selected ancestors,
+  and its relations are never queried;
+* unrelated models are released as soon as a worker is free — waiting on an ancestor never
+  occupies a worker;
+* intermediate models that are not selected (including `ephemeral` models) only pass the
+  constraint through; they are never compared or reported.
+
+Every selected model produces exactly one terminal record: `identical`, `different`, `error`,
+`unavailable` or `blocked`. `error` and `unavailable` both block descendants. The policy is
+local-only; combining `--dependency-policy independent` with `--cloud` is rejected before any
+request is sent.
+
 
 # Getting Started
 

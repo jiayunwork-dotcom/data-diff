@@ -3,7 +3,7 @@ import json
 import os
 import re
 import time
-from typing import List, Optional, Dict, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 import keyring
 import pydantic
 import rich
@@ -14,12 +14,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from data_diff.errors import (
     DataDiffCustomSchemaNoConfigError,
     DataDiffDbtProjectVarsNotFoundError,
+    DataDiffDependencyPolicyError,
     DataDiffNoAPIKeyError,
     DataDiffNoDatasourceIdError,
+    DataDiffTableNotFoundError,
+    DataDiffTableNotReadableError,
 )
 
 from data_diff import connect_to_table, diff_tables, Algorithm
 from data_diff.cloud import DatafoldAPI, TCloudApiDataDiff, TCloudApiOrgMeta
+from data_diff.dbt_dependency import (
+    DependencyPolicy,
+    DependencyScheduler,
+    ModelOutcome,
+    ModelResult,
+    build_dependency_plan,
+    failure_result,
+)
 from data_diff.dbt_parser import DbtParser, TDatadiffConfig
 from data_diff.diff_tables import DiffResultWrapper
 from data_diff.format import jsonify, jsonify_error
@@ -81,13 +92,58 @@ def dbt_diff(
     columns_flag: Optional[Tuple[str]] = None,
     production_database_flag: Optional[str] = None,
     production_schema_flag: Optional[str] = None,
+    dependency_policy: Union[DependencyPolicy, str, None] = None,
+    _parser: Optional["DbtParser"] = None,
+    _runner_factory: Optional[Callable[[Callable[[str], ModelResult]], Callable[[str], ModelResult]]] = None,
+    _connector: Optional[Callable[..., object]] = None,
 ) -> None:
+    """Compare dbt models.
+
+    ``dependency_policy`` defaults to ``"require_identical"``, which preserves
+    the historical behaviour of submitting every selected model at once.
+    ``"independent"`` only checks a model after all of its *selected* ancestors
+    settled ``identical``; the rest are reported ``blocked``.  ``"independent"``
+    is local-only and is rejected before any cloud request.
+
+    ``_parser`` and ``_runner_factory`` are test seams; production callers
+    leave them unset.
+    """
     print_version_info()
+    # Validate the policy before anything else, so a bad value never reaches
+    # the database (or the cloud API).  The default keeps the historical
+    # "submit every selected model at once" behaviour.
+    policy = DependencyPolicy.parse(dependency_policy)
     set_entrypoint_name(os.getenv("DATAFOLD_TRIGGERED_BY", "CLI-dbt"))
-    dbt_parser = DbtParser(profiles_dir_override, project_dir_override, state)
+    dbt_parser = _parser if _parser is not None else DbtParser(profiles_dir_override, project_dir_override, state)
     models = dbt_parser.get_models(dbt_selection)
     config = dbt_parser.get_datadiff_config()
     _initialize_events(dbt_parser.dbt_user_id, dbt_parser.dbt_version, dbt_parser.dbt_project_id)
+
+    if policy is DependencyPolicy.INDEPENDENT:
+        # Enforce the dependency policy for local comparisons only.  Cloud
+        # diffs are request-based, so refuse before sending anything.
+        if is_cloud:
+            raise DataDiffDependencyPolicyError(
+                "dependency_policy='independent' is only supported for local dbt comparisons; "
+                "it cannot be combined with --cloud."
+            )
+        _local_dbt_diff(
+            dbt_parser,
+            models,
+            config,
+            json_output=json_output,
+            where_flag=where_flag,
+            stats_flag=stats_flag,
+            columns_flag=columns_flag,
+            production_database_flag=production_database_flag,
+            production_schema_flag=production_schema_flag,
+            state=state,
+            log_status_handler=log_status_handler,
+            runner_factory=_runner_factory,
+            connector=_connector,
+        )
+        _extension_notification()
+        return
 
     if not state and not (config.prod_database or config.prod_schema):
         doc_url = "https://docs.datafold.com/development_testing/open_source#configure-your-dbt-project"
@@ -179,6 +235,492 @@ def dbt_diff(
             logger.error(f"An error occurred during the execution of a diff task: {model.unique_id} - {e}")
 
     _extension_notification()
+
+
+def _diff_vars_for_model(
+    dbt_parser: "DbtParser",
+    config: TDatadiffConfig,
+    model,
+    where_flag: Optional[str],
+    stats_flag: bool,
+    columns_flag: Optional[Tuple[str]],
+    production_database_flag: Optional[str],
+    production_schema_flag: Optional[str],
+) -> TDiffVars:
+    return _get_diff_vars(
+        dbt_parser,
+        config,
+        model,
+        where_flag,
+        stats_flag,
+        columns_flag,
+        production_database_flag,
+        production_schema_flag,
+    )
+
+
+class _LocalReport:
+    """Prints one terminal record per model, in completion order.
+
+    Nothing is buffered except the record itself, so large JSONL row details
+    are written straight out and never copied into a second structure.
+    """
+
+    def __init__(self, json_output: bool) -> None:
+        self.json_output = json_output
+
+    def emit(self, result: ModelResult) -> None:
+        if self.json_output:
+            print(json.dumps(result.json_record), flush=True)
+        else:
+            rich.print(result.text)
+
+
+def _unavailable_result(
+    diff_vars: TDiffVars, *, reason: str, model_label: Optional[str] = None
+) -> ModelResult:
+    return failure_result(
+        model_label or diff_vars.dbt_model,
+        (diff_vars.dev_path, diff_vars.prod_path),
+        error=reason,
+        outcome=ModelOutcome.UNAVAILABLE,
+    )
+
+
+def _error_result(diff_vars: TDiffVars, *, reason: str) -> ModelResult:
+    return failure_result(
+        diff_vars.dbt_model,
+        (diff_vars.dev_path, diff_vars.prod_path),
+        error=reason,
+        outcome=ModelOutcome.ERROR,
+    )
+
+
+def _local_dbt_diff(
+    dbt_parser: "DbtParser",
+    models,
+    config: TDatadiffConfig,
+    *,
+    json_output: bool,
+    where_flag: Optional[str],
+    stats_flag: bool,
+    columns_flag: Optional[Tuple[str]],
+    production_database_flag: Optional[str],
+    production_schema_flag: Optional[str],
+    state: Optional[str],
+    log_status_handler: Optional[LogStatusHandler],
+    runner_factory: Optional[Callable[[Callable[[str], ModelResult]], Callable[[str], ModelResult]]] = None,
+    connector: Optional[Callable[..., object]] = None,
+) -> None:
+    """Run a local dbt comparison constrained by ``dependency_policy``.
+
+    The plan is validated before a single connection is opened, so a bad
+    selection (duplicates, ephemeral, relation clashes, dangling refs, cycles)
+    or a cloud request fails before any table is queried.
+    """
+    manifest = dbt_parser.dev_manifest_obj
+    plan = build_dependency_plan(models, manifest)
+
+    dbt_parser.set_connection()
+    connection = dbt_parser.connection
+    threads = dbt_parser.threads
+    databases: List = []
+    base_connector = connector or connect_to_table
+
+    def opening_connector(db_info, table_name, key_columns, thread_count=1, **kwargs):
+        segment = base_connector(db_info, table_name, key_columns, thread_count=thread_count, **kwargs)
+        if all(db is not segment.database for db in databases):
+            databases.append(segment.database)
+        return segment
+
+    nodes = {node.unique_id: node for node in models}
+    diff_vars_by_id: Dict[str, TDiffVars] = {}
+    paths: Dict[str, Tuple[List[str], List[str]]] = {}
+    preflight: Dict[str, ModelResult] = {}
+
+    for unique_id in plan.selected:
+        model = nodes[unique_id]
+        try:
+            diff_vars = _diff_vars_for_model(
+                dbt_parser,
+                config,
+                model,
+                where_flag,
+                stats_flag,
+                columns_flag,
+                production_database_flag,
+                production_schema_flag,
+            )
+        except Exception as exc:  # e.g. custom schema with no prod_custom_schema
+            preflight[unique_id] = failure_result(
+                unique_id, (), error=str(exc) or type(exc).__name__, outcome=ModelOutcome.ERROR
+            )
+            continue
+        diff_vars_by_id[unique_id] = diff_vars
+        paths[unique_id] = (diff_vars.dev_path, diff_vars.prod_path)
+
+        # Missing production model (--state) is "unavailable", not identical.
+        if state and len(diff_vars.prod_path) < 2:
+            preflight[unique_id] = _unavailable_result(
+                diff_vars,
+                reason="New model: production manifest has no corresponding model. Nothing to diff.",
+                model_label=unique_id,
+            )
+            continue
+        if not diff_vars.primary_keys:
+            preflight[unique_id] = _unavailable_result(
+                diff_vars,
+                reason="No primary key found. Add uniqueness tests, meta, or tags.",
+                model_label=unique_id,
+            )
+
+    def _compare_one(unique_id: str) -> ModelResult:
+        return _run_local_model(
+            diff_vars_by_id[unique_id],
+            connection,
+            threads,
+            json_output,
+            connector=opening_connector,
+        )
+
+    runner = runner_factory(_compare_one) if runner_factory is not None else _compare_one
+
+    scheduler = DependencyScheduler(
+        plan,
+        runner,
+        workers=threads or 1,
+        preflight=preflight,
+        paths=paths,
+        emit=_LocalReport(json_output).emit,
+        observer=log_status_handler.observe if log_status_handler else None,
+    )
+    try:
+        with log_status_handler.status if log_status_handler else nullcontext():
+            scheduler.run()
+    finally:
+        # The per-model connections belong to this run; releasing them also
+        # prevents a later, independent call from inheriting a stale session.
+        for database in databases:
+            try:
+                database.close()
+            except Exception:  # pragma: no cover - cleanup must not mask results
+                logger.debug("Error while closing a comparison connection", exc_info=True)
+
+
+EMPTY_TABLE_ERROR = "Table appears to be empty"
+
+
+def _is_empty_table_error(exc: BaseException) -> bool:
+    return EMPTY_TABLE_ERROR in str(exc)
+
+
+def _empty_relations_result(
+    diff_vars: TDiffVars,
+    table1,
+    table2,
+    table1_columns: Dict,
+    table2_columns: Dict,
+    columns_added,
+    columns_removed,
+    columns_type_changed,
+    diff_output_str: str,
+    json_output: bool,
+) -> ModelResult:
+    """Conclude a comparison where JOINDIFF could not find a key range.
+
+    An empty relation is not "no differences": if the other side has rows (in
+    scope), the result is ``different``.  Row counts respect the same filter,
+    and column differences still count.  This only runs after a real query.
+    """
+    try:
+        count1 = table1.count()
+        count2 = table2.count()
+    except Exception as ex:
+        return _error_result(diff_vars, reason=str(ex) or type(ex).__name__)
+
+    is_different = bool(
+        count1 != count2 or columns_added or columns_removed or columns_type_changed
+    )
+    outcome = ModelOutcome.DIFFERENT if is_different else ModelOutcome.IDENTICAL
+    dev_path = tuple(diff_vars.dev_path)
+    prod_path = tuple(diff_vars.prod_path)
+
+    if json_output:
+        record = {
+            "version": "1.1.0",
+            "status": "success",
+            "result": outcome.value,
+            "outcome": outcome.value,
+            "model": diff_vars.dbt_model,
+            "dataset1": list(prod_path),
+            "dataset2": list(dev_path),
+            "rows": None,
+            "summary": {
+                "rows": {
+                    "total": {"dataset1": count1, "dataset2": count2},
+                    "exclusive": {"dataset1": 0, "dataset2": 0},
+                    "updated": 0,
+                    "unchanged": min(count1, count2),
+                },
+                "stats": {"diffCounts": {}},
+            },
+            "columns": {
+                "dataset1": _column_records(table1, table1_columns),
+                "dataset2": _column_records(table2, table2_columns),
+                "primaryKey": list(diff_vars.primary_keys),
+                "exclusive": {
+                    "dataset1": list(columns_removed),
+                    "dataset2": list(columns_added),
+                },
+                "typeChanged": list(columns_type_changed),
+            },
+        }
+        return ModelResult(
+            unique_id=diff_vars.dbt_model,
+            outcome=outcome,
+            dev_path=dev_path,
+            prod_path=prod_path,
+            json_record=record,
+        )
+
+    header = _diff_output_base(".".join(diff_vars.dev_path), ".".join(diff_vars.prod_path))
+    if is_different:
+        text = (
+            header
+            + diff_output_str
+            + dbt_diff_string_template(
+                total_rows_table1=count1,
+                total_rows_table2=count2,
+                total_rows_diff=count2 - count1,
+                rows_added=max(count2 - count1, 0),
+                rows_removed=max(count1 - count2, 0),
+                rows_updated=0,
+                rows_unchanged=min(count1, count2),
+                extra_info_dict=None,
+            )
+            + "\n"
+        )
+    else:
+        text = header + diff_output_str + no_differences_template()
+    return ModelResult(
+        unique_id=diff_vars.dbt_model,
+        outcome=outcome,
+        dev_path=dev_path,
+        prod_path=prod_path,
+        text=text,
+    )
+
+
+def _column_records(table, columns: Dict) -> list:
+    """Render a schema for JSONL, using the same shape as ``jsonify``."""
+    records = []
+    for info in columns.values():
+        try:
+            parsed = table.database.dialect.parse_type(table.table_path, info)
+        except Exception:
+            parsed = None
+        records.append({"name": info.column_name, "type": info.data_type, "kind": _kind_name(parsed)})
+    return records
+
+
+def _kind_name(col_type) -> str:
+    from data_diff.format import ColumnKind, _map_kind
+
+    return _map_kind(col_type).value if col_type is not None else ColumnKind.UNSUPPORTED.value
+
+
+def _local_model_result(
+    diff_vars: TDiffVars,
+    table1_columns: Dict,
+    table2_columns: Dict,
+    diff: DiffResultWrapper,
+    columns_added,
+    columns_removed,
+    columns_type_changed,
+    table1,
+    table2,
+    json_output: bool,
+    diff_output_str: str,
+) -> ModelResult:
+    """Turn a completed local comparison into a structured terminal record.
+
+    The conclusion drives scheduling, text and JSONL alike; it is never
+    inferred back from a printed string.
+    """
+    dev_path = tuple(diff_vars.dev_path)
+    prod_path = tuple(diff_vars.prod_path)
+    header = _diff_output_base(".".join(diff_vars.dev_path), ".".join(diff_vars.prod_path))
+
+    is_different = bool(diff.result_list or columns_added or columns_removed or columns_type_changed)
+    outcome = ModelOutcome.DIFFERENT if is_different else ModelOutcome.IDENTICAL
+
+    if json_output:
+        dataset1_columns = [
+            (info.column_name, info.data_type, table1.database.dialect.parse_type(table1.table_path, info))
+            for info in table1_columns.values()
+        ]
+        dataset2_columns = [
+            (info.column_name, info.data_type, table2.database.dialect.parse_type(table2.table_path, info))
+            for info in table2_columns.values()
+        ]
+        record = jsonify(
+            diff,
+            dbt_model=diff_vars.dbt_model,
+            dataset1_columns=dataset1_columns,
+            dataset2_columns=dataset2_columns,
+            with_summary=True,
+            columns_diff={
+                "added": columns_added,
+                "removed": columns_removed,
+                "changed": columns_type_changed,
+            },
+            stats_only=diff_vars.stats_flag,
+        )
+        record["outcome"] = outcome.value
+        return ModelResult(
+            unique_id=diff_vars.dbt_model,
+            outcome=outcome,
+            dev_path=dev_path,
+            prod_path=prod_path,
+            json_record=record,
+        )
+
+    if diff.result_list:
+        text = header + diff_output_str + f"{diff.get_stats_string(is_dbt=True)} \n"
+    else:
+        text = header + diff_output_str + no_differences_template()
+    return ModelResult(
+        unique_id=diff_vars.dbt_model,
+        outcome=outcome,
+        dev_path=dev_path,
+        prod_path=prod_path,
+        text=text,
+    )
+
+
+def _run_local_model(
+    diff_vars: TDiffVars,
+    connection: Dict[str, Optional[str]],
+    threads: Optional[int],
+    json_output: bool = False,
+    connector: Optional[Callable[..., object]] = None,
+) -> ModelResult:
+    """Compare one model's dev/prod relations and classify the outcome.
+
+    Missing primary key / missing prod relation are ``unavailable``; permission,
+    connection and query failures are ``error``.  A real not-found error from
+    the adapter is also classified ``unavailable``; anything the adapter cannot
+    distinguish stays ``error``.  Only a completed comparison with no row,
+    column or type difference is ``identical``.
+    """
+    connect = connector or connect_to_table
+    dev_qualified_str = ".".join(diff_vars.dev_path)
+    prod_qualified_str = ".".join(diff_vars.prod_path)
+
+    dev_table1 = connect(connection, prod_qualified_str, tuple(diff_vars.primary_keys), thread_count=threads)
+    dev_table2 = connect(connection, dev_qualified_str, tuple(diff_vars.primary_keys), thread_count=threads)
+
+    try:
+        table1_columns = dev_table1.get_schema()
+    except DataDiffTableNotFoundError as ex:
+        return _unavailable_result(
+            diff_vars, reason=f"Production relation does not exist: {ex}", model_label=diff_vars.dbt_model
+        )
+    except DataDiffTableNotReadableError as ex:
+        # The relation is there, but this user cannot read it: a permission
+        # failure, not a brand-new model.
+        return _error_result(diff_vars, reason=str(ex) or type(ex).__name__)
+    except Exception as ex:
+        return _error_result(diff_vars, reason=str(ex) or type(ex).__name__)
+
+    try:
+        table2_columns = dev_table2.get_schema()
+    except DataDiffTableNotFoundError as ex:
+        return _unavailable_result(
+            diff_vars, reason=f"Development relation does not exist: {ex}", model_label=diff_vars.dbt_model
+        )
+    except DataDiffTableNotReadableError as ex:
+        return _error_result(diff_vars, reason=str(ex) or type(ex).__name__)
+    except Exception as ex:
+        return _error_result(diff_vars, reason=str(ex) or type(ex).__name__)
+
+    table1_column_names = set(table1_columns.keys())
+    table2_column_names = set(table2_columns.keys())
+    column_set = table1_column_names.intersection(table2_column_names)
+    columns_added = table2_column_names.difference(table1_column_names)
+    columns_removed = table1_column_names.difference(table2_column_names)
+    columns_type_changed = {
+        k for k, v in table2_columns.items() if k in table1_columns and v.data_type != table1_columns[k].data_type
+    }
+
+    diff_output_str = f"Primary Keys: {diff_vars.primary_keys} \n"
+    if diff_vars.where_filter:
+        diff_output_str += f"Where Filter: '{str(diff_vars.where_filter)}' \n"
+    if diff_vars.include_columns:
+        diff_output_str += f"Included Columns: {diff_vars.include_columns} \n"
+    if diff_vars.exclude_columns:
+        diff_output_str += f"Excluded Columns: {diff_vars.exclude_columns} \n"
+    if columns_removed:
+        diff_output_str += columns_removed_template(columns_removed)
+    if columns_added:
+        diff_output_str += columns_added_template(columns_added)
+    if columns_type_changed:
+        diff_output_str += columns_type_changed_template(columns_type_changed)
+        column_set = column_set.difference(columns_type_changed)
+
+    column_set = column_set - set(diff_vars.primary_keys)
+    if diff_vars.include_columns:
+        column_set = {x for x in column_set if x.upper() in [y.upper() for y in diff_vars.include_columns]}
+    if diff_vars.exclude_columns:
+        column_set = {x for x in column_set if x.upper() not in [y.upper() for y in diff_vars.exclude_columns]}
+
+    diff: DiffResultWrapper = diff_tables(
+        dev_table1,
+        dev_table2,
+        threaded=True,
+        algorithm=Algorithm.JOINDIFF,
+        extra_columns=tuple(column_set),
+        where=diff_vars.where_filter,
+        skip_null_keys=True,
+    )
+    try:
+        # Drain the iterator so stats/info_tree describe a complete comparison
+        # even in stats-only mode; never show the rows here.
+        list(diff)
+    except Exception as ex:
+        if _is_empty_table_error(ex):
+            # JOINDIFF bisection needs a key range; an empty relation has none.
+            # Compare real row counts (honouring the filter) instead of
+            # pretending the tables are identical.
+            return _empty_relations_result(
+                diff_vars,
+                dev_table1,
+                dev_table2,
+                table1_columns,
+                table2_columns,
+                columns_added,
+                columns_removed,
+                columns_type_changed,
+                diff_output_str,
+                json_output,
+            )
+        return _error_result(diff_vars, reason=str(ex) or type(ex).__name__)
+    finally:
+        diff.close()
+
+    return _local_model_result(
+        diff_vars,
+        table1_columns,
+        table2_columns,
+        diff,
+        columns_added,
+        columns_removed,
+        columns_type_changed,
+        dev_table1,
+        dev_table2,
+        json_output,
+        diff_output_str,
+    )
 
 
 def _get_diff_vars(

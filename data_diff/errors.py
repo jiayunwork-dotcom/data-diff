@@ -84,3 +84,23 @@ class DataDiffUnsupportedConsistencyError(DataDiffConsistencyError, NotImplement
 
 class DataDiffIncompleteResultError(RuntimeError):
     "Raised when consuming or summarising a diff result that was closed before it was fully consumed."
+
+
+class DataDiffDependencyPolicyError(ValueError):
+    "Raised when dbt_diff is given an unknown dependency policy, or one that cannot be honoured."
+
+
+class DataDiffDependencyGraphError(Exception):
+    "Raised when the selected dependency subgraph is invalid (dangling model reference or cycle)."
+
+
+class DataDiffSelectionConflictError(Exception):
+    "Raised when the selected models cannot be identified unambiguously (duplicates, ephemeral, etc.)."
+
+
+class DataDiffTableNotFoundError(RuntimeError):
+    "Raised by a database adapter when a relation does not exist (as opposed to being inaccessible)."
+
+
+class DataDiffTableNotReadableError(RuntimeError):
+    "Raised by a database adapter when a relation exists but its columns cannot be read by this user."

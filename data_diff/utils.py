@@ -604,6 +604,13 @@ class LogStatusHandler(logging.Handler):
         self.diff_status[model_name] = "[green]Finished   [/]"
         self._update_diff_status()
 
+    def observe(self, event: str, model_name):
+        """Hook for the dependency scheduler: 'ready' | 'start' | 'finish'."""
+        if event == "start":
+            self.diff_started(model_name)
+        elif event == "finish":
+            self.diff_finished(model_name)
+
     def _update_diff_status(self, log=None):
         status_string = "\n"
         for model_name, status in self.diff_status.items():

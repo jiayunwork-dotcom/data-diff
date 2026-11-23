@@ -22,6 +22,7 @@ from data_diff.databases.postgresql import (
     PostgresqlDialect,
 )
 from data_diff.schema import RawColumnInfo
+from data_diff.errors import DataDiffTableNotFoundError
 
 
 @attrs.define(frozen=False)
@@ -107,7 +108,7 @@ class Redshift(PostgreSQL):
     def query_external_table_schema(self, path: DbPath) -> Dict[str, RawColumnInfo]:
         rows = self.query(self.select_external_table_schema(path), list)
         if not rows:
-            raise RuntimeError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
+            raise DataDiffTableNotFoundError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
 
         schema_dict = self._normalize_schema_info(rows)
         return schema_dict
@@ -122,7 +123,7 @@ class Redshift(PostgreSQL):
     def query_pg_get_cols(self, path: DbPath) -> Dict[str, RawColumnInfo]:
         rows = self.query(self.select_view_columns(path), list)
         if not rows:
-            raise RuntimeError(f"{self.name}: View '{'.'.join(path)}' does not exist, or has no columns")
+            raise DataDiffTableNotFoundError(f"{self.name}: View '{'.'.join(path)}' does not exist, or has no columns")
 
         schema_dict = self._normalize_schema_info(rows)
         return schema_dict
@@ -153,7 +154,7 @@ class Redshift(PostgreSQL):
     def query_svv_columns(self, path: DbPath) -> Dict[str, RawColumnInfo]:
         rows = self.query(self.select_svv_columns_schema(path), list)
         if not rows:
-            raise RuntimeError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
+            raise DataDiffTableNotFoundError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
 
         d = {
             r[0]: RawColumnInfo(

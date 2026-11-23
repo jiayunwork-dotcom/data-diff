@@ -1,5 +1,7 @@
-from typing import Any, ClassVar, Dict, List, Type
+import logging
+from typing import Any, ClassVar, Dict, List, Optional, Type
 from urllib.parse import unquote
+
 import attrs
 
 from data_diff.abcs.database_types import (
@@ -29,6 +31,8 @@ from data_diff.databases.base import (
 )
 
 SESSION_TIME_ZONE = None  # Changed by the tests
+
+logger = logging.getLogger(__name__)
 
 
 @import_helper("postgresql")
@@ -263,6 +267,29 @@ class PostgreSQL(ThreadedDatabase):
             f"FROM {'.'.join(info_schema_path)} "
             f"WHERE table_name = '{table}' AND table_schema = '{schema}'"
         )
+
+    def relation_exists(self, path: DbPath) -> Optional[bool]:
+        """Whether the relation exists, even if this user cannot read it.
+
+        ``to_regclass`` resolves through the system catalog and returns NULL
+        for a missing relation, while ``information_schema.columns`` already
+        hides columns of relations the user cannot access.  This is what lets
+        a permission denial stay an ``error`` instead of being guessed as a
+        brand-new model.
+        """
+        database, schema, table = self._normalize_table_path(path)
+        # Quote identifiers so mixed-case relation names are not folded to
+        # lower case by the lookup.
+        qualified = ".".join(self.dialect.quote(part) for part in (schema, table) if part)
+        literal = qualified.replace("'", "''")
+        sql = f"SELECT to_regclass('{literal}') IS NOT NULL AS present"
+        try:
+            rows = self.query(sql, list)
+        except Exception as ex:
+            # Cannot tell; do not guess.
+            logger.debug("Could not check relation existence for %s: %s", qualified, ex)
+            return None
+        return bool(rows and rows[0][0])
 
     def _normalize_table_path(self, path: DbPath) -> DbPath:
         if len(path) == 1:

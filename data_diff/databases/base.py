@@ -33,6 +33,7 @@ import attrs
 from typing_extensions import Self
 
 from data_diff.abcs.compiler import AbstractCompiler, Compilable
+from data_diff.errors import DataDiffTableNotFoundError, DataDiffTableNotReadableError
 from data_diff.queries.extras import ApplyFuncAndNormalizeAsString, Checksum, NormalizeAsString
 from data_diff.schema import RawColumnInfo
 from data_diff.utils import ArithString, ArithUUID, is_uuid, join_iter, safezip
@@ -1048,8 +1049,22 @@ class Database(abc.ABC):
         rows = self.query(self.select_table_schema(path), list, log_message=path)
 
         if not rows:
-            raise RuntimeError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
-
+            # An empty schema result is ambiguous: the relation may be missing,
+            # or it may exist but be unreadable by this user (PostgreSQL hides
+            # columns it cannot see).  Ask the adapter when it can tell.
+            exists = self.relation_exists(path)
+            if exists is True:
+                raise DataDiffTableNotReadableError(
+                    f"{self.name}: Table '{'.'.join(path)}' exists but has no readable columns"
+                )
+            if exists is None:
+                # The adapter could not distinguish the two cases; do not
+                # guess "new model".
+                raise DataDiffTableNotReadableError(
+                    f"{self.name}: Table '{'.'.join(path)}' has no visible columns, "
+                    "and its existence could not be confirmed"
+                )
+            raise DataDiffTableNotFoundError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
         d = {
             r[0]: RawColumnInfo(
                 column_name=r[0],
@@ -1064,6 +1079,16 @@ class Database(abc.ABC):
 
         assert len(d) == len(rows)
         return d
+
+    def relation_exists(self, path: DbPath) -> Optional[bool]:
+        """Whether the relation exists (regardless of this user's read access).
+
+        Returns ``True``/``False`` when the adapter can tell, and ``None`` when
+        it cannot.  Adapters that can distinguish a missing relation from an
+        inaccessible one override this; the default says "unknown", so a schema
+        denial is never misreported as a brand-new model.
+        """
+        return None
 
     def select_table_unique_columns(self, path: DbPath) -> str:
         """Provide SQL for selecting the names of unique columns in the table"""
